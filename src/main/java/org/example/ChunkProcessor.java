@@ -27,9 +27,10 @@ public class ChunkProcessor implements Runnable {
             var semicolonPos = findByte(cursor, ';');
             var newlinePos = findByte(semicolonPos + 1, '\n');
             var name = stringAt(cursor, semicolonPos);
-            var temp = Double.parseDouble(stringAt(semicolonPos + 1, newlinePos));
+
+            var intTemp = parseTemperature(semicolonPos);
+
             var stats = statsMap.computeIfAbsent(name, k -> new StationStats(name));
-            var intTemp = (int) Math.round(10 * temp);
 
             stats.sum += intTemp;
             stats.count++;
@@ -39,6 +40,30 @@ public class ChunkProcessor implements Runnable {
         }
 
         results[myIndex] = statsMap.values().toArray(StationStats[]::new);
+    }
+
+    private int parseTemperature(long semicolonPos) {
+        long off = semicolonPos + 1;
+        int sign = 1;
+
+        byte b = chunk.get(JAVA_BYTE, off++);
+
+        if (b == '-') {
+            sign = -1;
+        }
+
+        int temp = b - '0';
+        b = chunk.get(JAVA_BYTE, off++);
+
+        if (b != '.') {
+            temp = 10 * temp + b - '0';
+            off++;
+        }
+
+        b = chunk.get(JAVA_BYTE, off);
+        temp = 10 * temp + b - '0';
+
+        return sign * temp;
     }
 
     private String stringAt(long start, long limit) {
