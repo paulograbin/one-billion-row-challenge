@@ -2,8 +2,10 @@ package org.example;
 
 import java.lang.foreign.MemorySegment;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 
@@ -14,6 +16,10 @@ public class ChunkProcessor implements Runnable {
     private final StationStats[][] results;
     private final int myIndex;
     private final Map<String, StationStats> statsMap = new HashMap<>();
+
+    private static final int HASHTABLE_SIZE = 2048;
+    private final StatsAcc[] hashtable = new StatsAcc[HASHTABLE_SIZE];
+
 
     public ChunkProcessor(MemorySegment chunk, StationStats[][] results, int myIndex) {
         this.chunk = chunk;
@@ -26,21 +32,49 @@ public class ChunkProcessor implements Runnable {
         for (var cursor = 0L; cursor < chunk.byteSize(); ) {
             var semicolonPos = findByte(cursor, ';');
             var newlinePos = findByte(semicolonPos + 1, '\n');
-            var name = stringAt(cursor, semicolonPos);
+            var temp = parseTemperature(semicolonPos);
 
-            var intTemp = parseTemperature(semicolonPos);
-
-            var stats = statsMap.computeIfAbsent(name, k -> new StationStats(name));
-
-            stats.sum += intTemp;
-            stats.count++;
-            stats.min = Math.min(stats.min, intTemp);
-            stats.max = Math.max(stats.max, intTemp);
+            var acc = findAcc(cursor, semicolonPos);
+            acc.sum += temp;
+            acc.count++;
+            acc.min = Math.min(acc.min, temp);
+            acc.max = Math.max(acc.max, temp);
             cursor = newlinePos + 1;
         }
 
-        results[myIndex] = statsMap.values().toArray(StationStats[]::new);
+        results[myIndex] = Arrays.stream(hashtable)
+                .filter(Objects::nonNull)
+                .map(acc -> new StationStats(acc, chunk))
+                .toArray(StationStats[]::new);
     }
+
+    private StatsAcc findAcc(long cursor, long semicolonPos) {
+        int hash = hash(cursor, semicolonPos);
+        int slotPos = hash & (HASHTABLE_SIZE - 1);
+        while (true) {
+            var acc = hashtable[slotPos];
+            if (acc == null) {
+                acc = new StatsAcc(hash, cursor, semicolonPos - cursor);
+                hashtable[slotPos] = acc;
+                return acc;
+            }
+
+            if (acc.hash == hash && acc.nameEquals(chunk, cursor, semicolonPos)) {
+                return acc;
+            }
+            slotPos = (slotPos + 1) & (HASHTABLE_SIZE - 1);
+        }
+    }
+
+    private int hash(long startOffset, long limitOffset) {
+        int h = 17;
+        for (long off = startOffset; off < limitOffset; off++) {
+            h = 31 * h + ((int) chunk.get(JAVA_BYTE, off) & 0xFF);
+        }
+
+        return h;
+    }
+
 
     private int parseTemperature(long semicolonPos) {
         long off = semicolonPos + 1;

@@ -1,15 +1,22 @@
 package org.example;
 
-public class StationStats implements Comparable<StationStats> {
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.charset.StandardCharsets;
 
+public class StationStats implements Comparable<StationStats> {
     String name;
     long sum;
     int count;
     int min;
     int max;
 
-    public StationStats(String name) {
-        this.name = name;
+    StationStats(StatsAcc acc, MemorySegment chunk) {
+        name = new String(chunk.asSlice(acc.nameOffset, acc.nameLen).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
+        sum = acc.sum;
+        count = acc.count;
+        min = acc.min;
+        max = acc.max;
     }
 
     @Override
@@ -18,8 +25,8 @@ public class StationStats implements Comparable<StationStats> {
     }
 
     @Override
-    public boolean equals(Object obj) {
-        return super.equals(obj);
+    public boolean equals(Object that) {
+        return that.getClass() == StationStats.class && ((StationStats) that).name.equals(this.name);
     }
 
     @Override
