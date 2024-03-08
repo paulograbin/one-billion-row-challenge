@@ -11,8 +11,8 @@ public class StationStats implements Comparable<StationStats> {
     int min;
     int max;
 
-    StationStats(StatsAcc acc, MemorySegment chunk) {
-        name = new String(chunk.asSlice(acc.nameOffset, acc.nameLen).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
+    StationStats(ChunkProcessor.StatsAcc acc) {
+        name = acc.exportNameString();
         sum = acc.sum;
         count = acc.count;
         min = acc.min;
