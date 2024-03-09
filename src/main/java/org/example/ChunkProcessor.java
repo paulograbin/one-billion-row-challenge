@@ -32,7 +32,8 @@ public class ChunkProcessor implements Runnable {
             Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
             theUnsafe.setAccessible(true);
             return (Unsafe) theUnsafe.get(Unsafe.class);
-        } catch (NoSuchFieldException | IllegalAccessException e) {
+        }
+        catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
     }
@@ -47,51 +48,97 @@ public class ChunkProcessor implements Runnable {
 
     @Override
     public void run() {
-        long cursor = 0;
-        while (cursor < inputSize) {
-            long nameStartOffset = cursor;
-            long hash = 0;
-            int nameLen = 0;
-            while (true) {
-                long nameWord = UNSAFE.getLong(inputBase + nameStartOffset + nameLen);
-                long matchBits = semicolonMatchBits(nameWord);
-                if (matchBits != 0) {
-                    nameLen += nameLen(matchBits);
-                    nameWord = maskWord(nameWord, matchBits);
-                    hash = hash(hash, nameWord);
-                    cursor += nameLen;
-                    long tempWord = UNSAFE.getLong(inputBase + cursor);
-                    int dotPos = dotPos(tempWord);
-                    int temperature = parseTemperature(tempWord, dotPos);
-                    cursor += (dotPos >> 3) + 3;
-                    findAcc(hash, nameStartOffset, nameLen, nameWord).observe(temperature);
-                    break;
-                }
-                hash = hash(hash, nameWord);
-                nameLen += Long.BYTES;
-            }
-        }
+        processChunk();
         results[myIndex] = Arrays.stream(hashtable)
                 .filter(Objects::nonNull)
                 .map(StationStats::new)
                 .toArray(StationStats[]::new);
     }
 
+    private void processChunk() {
+        long cursor = 0;
+        long lastNameWord;
+        while (cursor < inputSize) {
+            long nameStartOffset = cursor;
+            long nameWord0 = getLong(nameStartOffset);
+            long nameWord1 = getLong(nameStartOffset + Long.BYTES);
+            long matchBits0 = semicolonMatchBits(nameWord0);
+            long matchBits1 = semicolonMatchBits(nameWord1);
 
-    private StatsAcc findAcc(long hash, long nameStartOffset, int nameLen, long lastNameWord) {
+            int temperature;
+            StatsAcc acc;
+            long hash;
+            int nameLen;
+            if ((matchBits0 | matchBits1) != 0) {
+                int nameLen0 = nameLen(matchBits0);
+                int nameLen1 = nameLen(matchBits1);
+                nameWord0 = maskWord(nameWord0, matchBits0);
+                // bit 3 of nameLen0 is on iff semicolon is not in nameWord0.
+                // this broadcasts bit 3 across the whole long word.
+                long nameWord1Mask = (long) nameLen0 << 60 >> 63;
+                // nameWord1 must be zero if semicolon is in nameWord0
+                nameWord1 = maskWord(nameWord1, matchBits1) & nameWord1Mask;
+                nameLen1 &= (int) (nameWord1Mask & 0b111);
+                nameLen = nameLen0 + nameLen1 + 1; // we'll include the semicolon in the name
+                lastNameWord = (nameWord0 & ~nameWord1Mask) | nameWord1;
+
+                cursor += nameLen;
+                long tempWord = getLong(cursor);
+                int dotPos = dotPos(tempWord);
+                temperature = parseTemperature(tempWord, dotPos);
+
+                cursor += (dotPos >> 3) + 3;
+                hash = hash(nameWord0);
+                acc = findAcc2(hash, nameWord0, nameWord1);
+                if (acc != null) {
+                    acc.observe(temperature);
+                    continue;
+                }
+            } else {
+                hash = hash(nameWord0);
+                nameLen = 2 * Long.BYTES;
+                while (true) {
+                    lastNameWord = getLong(nameStartOffset + nameLen);
+                    long matchBits = semicolonMatchBits(lastNameWord);
+                    if (matchBits != 0) {
+                        nameLen += nameLen(matchBits) + 1;
+                        lastNameWord = maskWord(lastNameWord, matchBits);
+                        cursor += nameLen;
+                        long tempWord = getLong(cursor);
+                        int dotPos = dotPos(tempWord);
+                        temperature = parseTemperature(tempWord, dotPos);
+                        cursor += (dotPos >> 3) + 3;
+                        break;
+                    }
+                    nameLen += Long.BYTES;
+                }
+            }
+            ensureAcc(hash, nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord).observe(temperature);
+        }
+    }
+
+    private StatsAcc findAcc2(long hash, long nameWord0, long nameWord1) {
+        int slotPos = (int) hash & (HASHTABLE_SIZE - 1);
+        var acc = hashtable[slotPos];
+        if (acc != null && acc.hash == hash && acc.nameEquals2(nameWord0, nameWord1)) {
+            return acc;
+        }
+        return null;
+    }
+
+    private StatsAcc ensureAcc(long hash, long nameStartOffset, int nameLen,
+                               long nameWord0, long nameWord1, long lastNameWord) {
         int initialPos = (int) hash & (HASHTABLE_SIZE - 1);
         int slotPos = initialPos;
         while (true) {
             var acc = hashtable[slotPos];
             if (acc == null) {
-                acc = new StatsAcc(inputBase, hash, nameStartOffset, nameLen, lastNameWord);
+                acc = new StatsAcc(inputBase, hash, nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord);
                 hashtable[slotPos] = acc;
                 return acc;
             }
-            if (acc.hash == hash) {
-                if (acc.nameEquals(inputBase, nameStartOffset, nameLen, lastNameWord)) {
-                    return acc;
-                }
+            if (acc.hash == hash && acc.nameEquals(inputBase, nameStartOffset, nameLen, nameWord0, nameWord1, lastNameWord)) {
+                return acc;
             }
             slotPos = (slotPos + 1) & (HASHTABLE_SIZE - 1);
             if (slotPos == initialPos) {
@@ -101,10 +148,13 @@ public class ChunkProcessor implements Runnable {
     }
 
 
+    private long getLong(long offset) {
+        return UNSAFE.getLong(inputBase + offset);
+    }
+
     private static final long BROADCAST_SEMICOLON = 0x3B3B3B3B3B3B3B3BL;
     private static final long BROADCAST_0x01 = 0x0101010101010101L;
     private static final long BROADCAST_0x80 = 0x8080808080808080L;
-
 
     private static long semicolonMatchBits(long word) {
         long diff = word ^ BROADCAST_SEMICOLON;
@@ -120,48 +170,11 @@ public class ChunkProcessor implements Runnable {
     private static final long DOT_BITS = 0x10101000;
     private static final long MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
 
-
     // credit: merykitty
-    // The 4th binary digit of the ascii of a digit is 1 while
-    // that of the '.' is 0. This finds the decimal separator.
-    // The value can be 12, 20, 28
+    // Bit 4 of the ascii of a digit is 1, while that of '.' is 0.
+    // This finds the decimal separator. The value can be 12, 20, 28.
     private static int dotPos(long word) {
         return Long.numberOfTrailingZeros(~word & DOT_BITS);
-    }
-
-
-    private static long hash(long prevHash, long word) {
-        return Long.rotateLeft((prevHash ^ word) * 0x51_7c_c1_b7_27_22_0a_95L, 13);
-    }
-
-    // credit: merykitty
-    // word contains the number: X.X, -X.X, XX.X or -XX.X
-    private static int parseTemperatureOG(long word, int dotPos) {
-        // signed is -1 if negative, 0 otherwise
-        final long signed = (~word << 59) >> 63;
-        final long removeSignMask = ~(signed & 0xFF);
-        // Zeroes out the sign character in the word
-        long wordWithoutSign = word & removeSignMask;
-        // Shifts so that the digits come to fixed positions:
-        // 0xUU00TTHH00 (UU: units digit, TT: tens digit, HH: hundreds digit)
-        long digitsAligned = wordWithoutSign << (28 - dotPos);
-        // Turns ASCII chars into corresponding number values. The ASCII code
-        // of a digit is 0x3N, where N is the digit. Therefore, the mask 0x0F
-        // passes through just the numeric value of the digit.
-        final long digits = digitsAligned & 0x0F000F0F00L;
-        // Multiplies each digit with the appropriate power of ten.
-        // Representing 0 as . for readability,
-        // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
-        // 0x.U...T.H........ * 100 +
-        // 0x...U...T.H...... * 10 +
-        // 0x.......U...T.H..
-        //          ^--- H, T, and U are lined up here.
-        // This results in our temperature lying in bits 32 to 41 of this product.
-        final long absValue = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
-        // Apply the sign. It's either all 1's or all 0's. If it's all 1's,
-        // absValue ^ signed flips all bits. In essence, this does the two's
-        // complement operation -a = ~a + 1. (All 1's represents the number -1).
-        return (int) ((absValue ^ signed) - signed);
     }
 
     // credit: merykitty and royvanrijn
@@ -178,18 +191,25 @@ public class ChunkProcessor implements Runnable {
 
         // Multiply by a magic (100 * 0x1000000 + 10 * 0x10000 + 1), to get the result
         final long absValue = ((digits * MAGIC_MULTIPLIER) >>> 32) & 0x3FF;
-        // And apply the sign
+        // And apply sign
         return (int) ((absValue + signed) ^ signed);
     }
 
     private static int nameLen(long separator) {
-        return (Long.numberOfTrailingZeros(separator) >>> 3) + 1;
+        return (Long.numberOfTrailingZeros(separator) >>> 3);
+    }
+
+    private static long hash(long word) {
+        return Long.rotateLeft(word * 0x51_7c_c1_b7_27_22_0a_95L, 17);
     }
 
 
-
     static class StatsAcc {
-        long[] name;
+        private static final long[] emptyTail = new long[0];
+
+        long nameWord0;
+        long nameWord1;
+        long[] nameTail;
         long hash;
         int nameLen;
         int sum;
@@ -197,24 +217,44 @@ public class ChunkProcessor implements Runnable {
         int min;
         int max;
 
-        public StatsAcc(long inputBase, long hash, long nameStartOffset, int nameLen, long lastNameWord) {
+        public StatsAcc(long inputBase, long hash, long nameStartOffset, int nameLen, long nameWord0, long nameWord1, long lastNameWord) {
             this.hash = hash;
             this.nameLen = nameLen;
-            name = new long[(nameLen - 1) / 8 + 1];
-            for (int i = 0; i < name.length - 1; i++) {
-                name[i] = getLong(inputBase, nameStartOffset + i * Long.BYTES);
+            this.nameWord0 = nameWord0;
+            this.nameWord1 = nameWord1;
+            int nameTailLen = (nameLen - 1) / 8 - 1;
+            if (nameTailLen > 0) {
+                nameTail = new long[nameTailLen];
+                int i = 0;
+                for (; i < nameTailLen - 1; i++) {
+                    nameTail[i] = getLong(inputBase, nameStartOffset + (i + 2L) * Long.BYTES);
+                }
+                nameTail[i] = lastNameWord;
+            } else {
+                nameTail = emptyTail;
             }
-            name[name.length - 1] = lastNameWord;
         }
 
-        boolean nameEquals(long inputBase, long inputNameStart, long inputNameLen, long lastInputWord) {
-            int i = 0;
+        boolean nameEquals2(long nameWord0, long nameWord1) {
+            return this.nameWord0 == nameWord0 && this.nameWord1 == nameWord1;
+        }
+
+        private static final int NAMETAIL_OFFSET = 2 * Long.BYTES;
+
+        boolean nameEquals(long inputBase, long inputNameStart, long inputNameLen, long inputWord0, long inputWord1, long lastInputWord) {
+            boolean mismatch0 = inputWord0 != nameWord0;
+            boolean mismatch1 = inputWord1 != nameWord1;
+            boolean mismatch = mismatch0 | mismatch1;
+            if (mismatch | inputNameLen <= NAMETAIL_OFFSET) {
+                return !mismatch;
+            }
+            int i = NAMETAIL_OFFSET;
             for (; i <= inputNameLen - Long.BYTES; i += Long.BYTES) {
-                if (getLong(inputBase, inputNameStart + i) != name[i / 8]) {
+                if (getLong(inputBase, inputNameStart + i) != nameTail[(i - NAMETAIL_OFFSET) / 8]) {
                     return false;
                 }
             }
-            return i == inputNameLen || lastInputWord == name[i / 8];
+            return i == inputNameLen || lastInputWord == nameTail[(i - NAMETAIL_OFFSET) / 8];
         }
 
         void observe(int temperature) {
@@ -225,8 +265,10 @@ public class ChunkProcessor implements Runnable {
         }
 
         String exportNameString() {
-            var buf = ByteBuffer.allocate(name.length * 8).order(ByteOrder.LITTLE_ENDIAN);
-            for (long nameWord : name) {
+            var buf = ByteBuffer.allocate((2 + nameTail.length) * 8).order(ByteOrder.LITTLE_ENDIAN);
+            buf.putLong(nameWord0);
+            buf.putLong(nameWord1);
+            for (long nameWord : nameTail) {
                 buf.putLong(nameWord);
             }
             buf.flip();

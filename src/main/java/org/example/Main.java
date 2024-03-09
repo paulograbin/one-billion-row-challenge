@@ -13,47 +13,42 @@ import java.util.TreeMap;
 
 public class Main {
 
+    private static File file = new File("/home/paulograbin/Desktop/measurements.txt");
+//    private static File file = new File("/home/paulograbin/Desktop/measurements_small.txt");
+
     public static void main(String[] args) throws IOException, InterruptedException {
         var clockStart = System.currentTimeMillis();
 
-//        File file = new File("/home/paulograbin/Desktop/measurements_small.txt");
-        File file = new File("/home/paulograbin/Desktop/measurements.txt");
-        long fileLength = file.length();
+        final long length = file.length();
         int chunkCount = Runtime.getRuntime().availableProcessors();
         final var results = new StationStats[chunkCount][];
         final var chunkStartOffsets = new long[chunkCount];
 
-        var rar = new RandomAccessFile(file, "r");
+        try (var raf = new RandomAccessFile(file, "r")) {
+            for (int i = 1; i < chunkStartOffsets.length; i++) {
+                var start = length * i / chunkStartOffsets.length;
+                raf.seek(start);
 
-        for (int i = 1; i < chunkStartOffsets.length; i++) {
-            var start = fileLength * i / chunkStartOffsets.length;
-            rar.seek(start);
+                while (raf.read() != (byte) '\n') {
+                }
 
-            while (rar.read() != (byte) '\n') {
-
+                start = raf.getFilePointer();
+                chunkStartOffsets[i] = start;
             }
-
-            start = rar.getFilePointer();
-            chunkStartOffsets[i] = start;
+            final var mappedFile = raf.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, length, Arena.global());
+            var threads = new Thread[chunkCount];
+            for (int i = 0; i < chunkCount; i++) {
+                final long chunkStart = chunkStartOffsets[i];
+                final long chunkLimit = (i + 1 < chunkCount) ? chunkStartOffsets[i + 1] : length;
+                threads[i] = new Thread(new ChunkProcessor(mappedFile.asSlice(chunkStart, chunkLimit - chunkStart), results, i));
+            }
+            for (Thread thread : threads) {
+                thread.start();
+            }
+            for (Thread thread : threads) {
+                thread.join();
+            }
         }
-
-        MemorySegment mappedFile = rar.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, fileLength, Arena.global());
-        var threads = new Thread[chunkCount];
-
-        for (int i = 0; i < chunkCount; i++) {
-            long chunkStart = chunkStartOffsets[i];
-            long chunkLimit = (i + 1 < chunkCount) ? chunkStartOffsets[i + 1] : fileLength;
-
-            threads[i] = new Thread(new ChunkProcessor(mappedFile.asSlice(chunkStart, chunkLimit - chunkStart), results, i));
-        }
-
-        for (Thread thread : threads) {
-            thread.start();
-        }
-        for (Thread thread : threads) {
-            thread.join();
-        }
-
 
         var totalsMap = new TreeMap<String, StationStats>();
 
